@@ -1,116 +1,98 @@
-(function(ext) {
+(function(Scratch) {
+  "use strict";
 
-  const GRAVITY = 9.81; // meters per second squared
-  const AIR_RESISTANCE = 0.02;
-  
-  let world = null;
-  let bodies = [];
-  
-  // define blocks
-  ext._shutdown = function() {};
-  ext._getStatus = function() {
-    return {status: 2, msg: 'Ready'};
-  };
+  // Check if the MouseCursor extension is being run unsandboxed
+  if (!Scratch.extensions.unsandboxed) {
+    throw new Error("MouseCursor extension must be run unsandboxed");
+  }
 
-  ext.createWorld = function() {
-    world = new PhysicsWorld();
-  };
+  // Create a lazily instantiated canvas and context for encoding skins as data URIs
+  const createCanvasAndContext = () => {
+    let canvas = null;
+    let context = null;
 
-  ext.createBody = function(shape, options) {
-    const body = new PhysicsBody(shape, options);
-    bodies.push(body);
-    return body.id;
-  };
+    return (width, height) => {
+      if (!canvas) {
+        canvas = document.createElement("canvas");
+        context = canvas.getContext("2d");
 
-  ext.applyForce = function(bodyId, force) {
-    const body = getBodyById(bodyId);
-    body.applyForce(force);
-  };
-
-  ext.applyTorque = function(bodyId, torque) {
-    const body = getBodyById(bodyId);
-    body.applyTorque(torque);
-  };
-
-  ext.setLinearVelocity = function(bodyId, velocity) {
-    const body = getBodyById(bodyId);
-    body.setLinearVelocity(velocity);
-  };
-
-  ext.setAngularVelocity = function(bodyId, velocity) {
-    const body = getBodyById(bodyId);
-    body.setAngularVelocity(velocity);
-  };
-
-  ext.setGravity = function(acceleration) {
-    world.setGravity(acceleration);
-  };
-
-  // helper functions
-  function getBodyById(id) {
-    for (let i = 0; i < bodies.length; i++) {
-      if (bodies[i].id === id) {
-        return bodies[i];
+        if (!context) {
+          throw new Error("Could not get 2d rendering context");
+        }
       }
-    }
-    return null;
-  }
 
-  // classes
-  class PhysicsWorld {
-    constructor() {
-      this.gravity = {x: 0, y: GRAVITY};
+      // Setting the canvas width and height clears it
+      canvas.width = width;
+      canvas.height = height;
+
+      return [canvas, context];
+    };
+  };
+
+  const getRawSkinCanvas = createCanvasAndContext();
+
+  // Encode skins as data URIs
+  const encodeSkinToDataURL = (skin) => {
+    const svgSkin = skin instanceof RenderWebGL.SVGSkin ? skin : null;
+
+    if (svgSkin && svgSkin._svgImage) {
+      // This is an SVG skin, so just return its existing data URI
+      return svgSkin._svgImage.src;
     }
-    
-    setGravity(acceleration) {
-      this.gravity = acceleration;
+
+    // It's probably a bitmap skin.
+    // The most reliable way to get the bitmap in every runtime is through the silhouette.
+    // This is very slow and could involve reading the texture from the GPU.
+    const silhouette = skin._silhouette;
+    // unlazy() only exists in TW
+    if (silhouette.unlazy) {
+      silhouette.unlazy();
     }
-  }
-  
-  class PhysicsBody {
-    constructor(shape, options) {
-      this.id = Math.random().toString(36).substr(2, 9);
-      this.shape = shape;
-      this.mass = options.mass || 1;
-      this.position = options.position || {x: 0, y: 0};
-      this.velocity = options.velocity || {x: 0, y: 0};
-      this.acceleration = {x: 0, y: 0};
-      this.torque = 0;
-      this.angularVelocity = 0;
-      this.angularAcceleration = 0;
-      this.friction = options.friction || 0.5;
-      this.restitution = options.restitution || 0.5;
-      this.static = options.static || false;
-      this.angle = 0;
+    const colorData = silhouette._colorData;
+    const width = silhouette._width;
+    const height = silhouette._height;
+    const imageData = new ImageData(colorData, silhouette._width, silhouette._height);
+
+    const [canvas, context] = getRawSkinCanvas(width, height);
+    context.putImageData(imageData, 0, 0);
+
+    return canvas.toDataURL();
+  };
+
+  // Convert a costume to a cursor image with a maximum size
+  const costumeToCursor = (costume, maxWidth, maxHeight) => {
+    const skin = Scratch.vm.renderer._allSkins[costume.skinId];
+    const imageURI = encodeSkinToDataURL(skin);
+
+    let width = skin.size[0];
+    let height = skin.size[1];
+
+    // Scale the image down if its width or height exceeds the maximum size
+    if (width > maxWidth) {
+      height = (maxWidth / width) * height;
+      width = maxWidth;
     }
-    
-    applyForce(force) {
-      this.acceleration.x += force.x / this.mass;
-      this.acceleration.y += force.y / this.mass;
+    if (height > maxHeight) {
+      width = (maxHeight / height) * width;
+      height = maxHeight;
     }
-    
-    applyTorque(torque) {
-      this.angularAcceleration += torque / this.mass;
-    }
-    
-    setLinearVelocity(velocity) {
-      this.velocity = velocity;
-    }
-    
-    setAngularVelocity(velocity) {
-      this.angularVelocity = velocity;
-    }
-    
-    update(dt) {
-      if (!this.static) {
-        // apply gravity
-        this.acceleration.x += world.gravity.x;
-        this.acceleration.y += world.gravity.y;
-      
-        // apply air resistance
-        this.acceleration.x -= this.velocity.x * AIR_RESISTANCE;
-        this.acceleration.y -= this.velocity.y * AIR_RESISTANCE;
-      
-        // update position
-        this.position.x += this.velocity.x * dt;
-        this.position.y += this.velocity.y
+
+    width = Math.round(width);
+    height = Math.round(height);
+
+    // We wrap the encoded image in an <svg> to resize the image without a canvas.
+    // The browser can handle images with more raw pixels than their DPI-independent size,
+    // which prevents cursors from looking horrible on high DPI displays.
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"><image href="${imageURI}" width="${width}" height="${height}" /></svg>`;
+    const svgURI = `data:image/svg+xml,${encodeURIComponent(svg)}`;
+
+    return {
+      uri: svgURI,
+      width,
+      height
+    };
+  };
+
+  // Set up default cursor and canvas cursor
+  let nativeCursor = "default";
+  let currentCursor
